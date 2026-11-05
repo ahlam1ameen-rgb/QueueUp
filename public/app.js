@@ -1,5 +1,6 @@
 const root = document.querySelector("#app");
 const toastEl = document.querySelector("#toast");
+const notificationBannerEl = document.querySelector("#notification-banner");
 const REASONS = [
   { id: "help", label: "Get Help", icon: "✦", description: "A question, explanation, or topic" },
   { id: "grades", label: "View or Discuss Grades", icon: "↗" },
@@ -19,12 +20,17 @@ const state = {
   queue: null,
   notice: null,
   queueStatus: null,
-  previousEntryStatus: null,
-  previousQueueStatus: null,
-  alertedTwoAhead: false,
+  unreadCount: 0,
+  notificationCursor: null,
+  notifications: [],
+  notificationBannerQueue: [],
+  notificationBannerActive: false,
+  notificationReturnScreen: "instructors",
   turnDismissed: false,
   polling: null,
+  isPolling: false,
   toastTimer: null,
+  notificationBannerTimer: null,
 };
 
 function escapeHtml(value = "") {
@@ -51,6 +57,53 @@ function showToast(message, isError = false) {
   state.toastTimer = setTimeout(() => toastEl.classList.remove("show"), 2800);
 }
 
+const notificationIcons = {
+  joined: "✓",
+  ready: "!",
+  turn: "★",
+  queue_paused: "Ⅱ",
+  queue_resumed: "▶",
+  queue_closed: "×",
+};
+
+function notifyBrowser(notification) {
+  try {
+    if ("Notification" in window && Notification.permission === "granted") {
+      new Notification("QueueUp", { body: notification.message, icon: "/icon.svg" });
+    }
+  } catch {}
+}
+
+function showIncomingNotifications(notifications) {
+  state.notificationBannerQueue.push(...notifications.slice(-5).reverse());
+  if (!state.notificationBannerActive) showNextNotificationBanner();
+}
+
+function showNextNotificationBanner() {
+  const notification = state.notificationBannerQueue.shift();
+  if (!notification) {
+    state.notificationBannerActive = false;
+    return;
+  }
+  state.notificationBannerActive = true;
+  if (!notificationBannerEl) return;
+  const icon = notificationIcons[notification.type] || "•";
+  notificationBannerEl.innerHTML = `<span class="notification-banner-icon">${icon}</span>
+    <span class="notification-banner-message">${escapeHtml(notification.message)}</span>`;
+  notificationBannerEl.hidden = false;
+  notificationBannerEl.classList.add("visible");
+  clearTimeout(state.notificationBannerTimer);
+  state.notificationBannerTimer = setTimeout(() => {
+    notificationBannerEl.classList.remove("visible");
+    notificationBannerEl.hidden = true;
+    state.notificationBannerActive = false;
+    showNextNotificationBanner();
+  }, 3800);
+  if ("vibrate" in navigator) navigator.vibrate([120, 60, 120]);
+  else playAlertTone();
+  notifyBrowser(notification);
+}
+
 function playAlertTone() {
   try {
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
@@ -68,18 +121,22 @@ function playAlertTone() {
   } catch {}
 }
 
-function header(back = "", logout = false) {
+function header(back = "", logout = false, isStudent = false) {
   return `<header class="topbar">
     <div class="brand"><span class="brand-mark">Q</span>QueueUp</div>
     <div class="top-actions">
-      ${back ? `<button class="icon-button" data-action="back" aria-label="Go back">←</button>` : ""}
+      ${back ? `<button class="icon-button" data-action="back" data-destination="${escapeHtml(back)}" aria-label="Go back">←</button>` : ""}
+      ${isStudent ? `<button class="icon-button notification-bell" data-action="open-notifications" aria-label="Notifications${state.unreadCount ? `, ${state.unreadCount} unread` : ""}" title="Notifications">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 9a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4"/></svg>
+        ${state.unreadCount ? `<span class="notification-badge">${state.unreadCount > 99 ? "99+" : state.unreadCount}</span>` : ""}
+      </button>` : ""}
       ${logout ? `<button class="icon-button" data-action="logout" aria-label="Log out" title="Log out">↗</button>` : ""}
     </div>
   </header>`;
 }
 
-function shell(content, { back = "", logout = false, wide = false } = {}) {
-  root.innerHTML = `<div class="app-shell ${wide ? "wide" : ""}">${header(back, logout)}${content}</div>
+function shell(content, { back = "", logout = false, wide = false, student = false } = {}) {
+  root.innerHTML = `<div class="app-shell ${wide ? "wide" : ""}">${header(back, logout, student)}${content}</div>
     <section class="turn-overlay" id="turnOverlay" hidden aria-modal="true" role="dialog">
       <div class="turn-content"><div class="turn-icon">✓</div><p class="eyebrow" style="color:#a9d8c4">Office hours</p>
         <h2 id="turnTitle">It’s your turn!</h2><p id="turnMessage">Go in now.</p>
@@ -154,7 +211,7 @@ function renderInstructors() {
     : `<div class="empty-state"><div class="empty-icon">⌕</div><h3>No instructors yet</h3><p>When instructors create QueueUp accounts, they’ll appear here.</p></div>`;
   shell(`<div class="heading-row"><div><p class="eyebrow">Hi, ${escapeHtml(state.user.fullName.split(" ")[0])}</p><h2>Find your instructor</h2><p class="muted" style="margin:0">Choose an open office-hours queue.</p></div></div>
     ${state.notice ? `<div class="banner warning">${escapeHtml(state.notice.text)}</div>` : ""}
-    <section class="instructor-list">${cards}</section>`, { logout: true });
+    <section class="instructor-list">${cards}</section>`, { logout: true, student: true });
 }
 
 function renderReason() {
@@ -170,7 +227,7 @@ function renderReason() {
       </button>`).join("")}</div>
     ${state.selectedReason === "other" ? `<label class="field other-field">Tell us a little more<input id="otherReason" maxlength="300" placeholder="What would you like to discuss?" required></label>` : ""}
     <p class="form-error ${state.reasonError ? "show" : ""}" id="reasonError">${escapeHtml(state.reasonError || "")}</p>
-    <button class="btn btn-primary" data-action="join-queue" style="width:100%;margin-top:18px" ${state.selectedReason ? "" : "disabled"}>Join queue <span aria-hidden="true">→</span></button>`, { back: "instructors", logout: true });
+    <button class="btn btn-primary" data-action="join-queue" style="width:100%;margin-top:18px" ${state.selectedReason ? "" : "disabled"}>Join queue <span aria-hidden="true">→</span></button>`, { back: "instructors", logout: true, student: true });
 }
 
 function renderStudentQueue() {
@@ -189,8 +246,8 @@ function renderStudentQueue() {
   } else if (queue.queueStatus === "closed" && !inOffice) {
     alertText = "This queue is closed. Your place is no longer active.";
     alertClass = "warning";
-  } else if (queue.ahead === 2 && !inOffice) {
-    alertText = `Get ready! 2 students ahead of you. Head to ${queue.officeLocation}.`;
+  } else if (queue.ahead <= 2 && !inOffice) {
+    alertText = `Get ready! Only 2 or fewer students ahead of you. Head to ${queue.officeLocation}.`;
   }
   shell(`<p class="eyebrow">Your place in line</p><h2>Live queue</h2>
     ${alertText ? `<div class="banner ${alertClass}">${escapeHtml(alertText)}</div>` : ""}
@@ -214,7 +271,62 @@ function renderStudentQueue() {
         <p>${queue.groupSize > 1 ? `You’ve been called in with your group for ${escapeHtml(queue.reasonLabel)}.` : "Go in now."}<br>${escapeHtml(queue.officeLocation)}</p>
         <button class="btn btn-primary" data-action="dismiss-turn" style="background:white;color:#173b70;width:100%">Got it</button>
       </div>
-    </div>`, { logout: true });
+    </div>`, { logout: true, student: true });
+}
+
+function relativeTime(value) {
+  const normalized = String(value || "").replace(" ", "T");
+  const date = new Date(/[zZ]|[+-]\d\d:\d\d$/.test(normalized) ? normalized : `${normalized}Z`);
+  const seconds = Math.max(0, Math.floor((Date.now() - date.getTime()) / 1000));
+  if (!Number.isFinite(seconds) || seconds < 45) return "just now";
+  if (seconds < 3600) {
+    const minutes = Math.floor(seconds / 60);
+    return `${minutes} min ago`;
+  }
+  if (seconds < 86400) {
+    const hours = Math.floor(seconds / 3600);
+    return `${hours} hr ago`;
+  }
+  const days = Math.floor(seconds / 86400);
+  return `${days} day${days === 1 ? "" : "s"} ago`;
+}
+
+function browserNotificationSettings() {
+  if (!("Notification" in window)) {
+    return `<div class="push-setting"><span><strong>Browser alerts unavailable</strong><small>Your in-app bell and banners still work.</small></span></div>`;
+  }
+  if (Notification.permission === "granted") {
+    return `<div class="push-setting"><span><strong>Browser alerts enabled</strong><small>Browser alerts appear while QueueUp is open; the in-app bell is always available.</small></span><span class="permission-check">✓</span></div>`;
+  }
+  if (Notification.permission === "denied") {
+    return `<div class="push-setting"><span><strong>Browser alerts are blocked</strong><small>Allow notifications in browser settings. The in-app bell and banners still work.</small></span></div>`;
+  }
+  return `<div class="push-setting"><span><strong>Enable browser alerts</strong><small>Optional browser pop-ups while QueueUp is open.</small></span><button class="btn btn-secondary btn-small" data-action="enable-browser-notifications">Enable notifications</button></div>`;
+}
+
+function renderNotifications() {
+  state.screen = "notifications";
+  const cards = state.notifications.length
+    ? state.notifications.map((notification) => `
+      <article class="notification-item ${notification.wasUnread ? "unread" : ""}">
+        <span class="notification-icon ${escapeHtml(notification.type)}">${notificationIcons[notification.type] || "•"}</span>
+        <span class="notification-item-content">
+          <span class="notification-message">${escapeHtml(notification.message)}</span>
+          <time datetime="${escapeHtml(notification.createdAt)}">${relativeTime(notification.createdAt)}</time>
+        </span>
+        ${notification.wasUnread ? `<span class="notification-unread-dot" aria-label="Unread"></span>` : ""}
+      </article>`).join("")
+    : `<div class="empty-state"><div class="empty-icon">♧</div><h3>You’re all caught up</h3><p>Queue updates and reminders will show up here.</p></div>`;
+  shell(`<div class="heading-row notification-heading">
+      <div><p class="eyebrow">Your updates</p><h2>Notifications</h2></div>
+      <button class="text-button" data-action="clear-notifications" ${state.notifications.length ? "" : "disabled"}>Clear all</button>
+    </div>
+    ${browserNotificationSettings()}
+    <section class="notification-list" aria-label="Your notifications">${cards}</section>`, {
+    back: state.notificationReturnScreen,
+    logout: true,
+    student: true,
+  });
 }
 
 function renderInstructorDashboard() {
@@ -256,62 +368,47 @@ function renderInstructorDashboard() {
 function renderCurrentScreen() {
   if (state.screen === "queue") renderStudentQueue();
   else if (state.screen === "instructors") renderInstructors();
+  else if (state.screen === "reason") renderReason();
+  else if (state.screen === "notifications") renderNotifications();
   else renderInstructorDashboard();
 }
 
-function alertTurn(queue) {
-  if (!queue || queue.entryStatus !== "in_office" || state.previousEntryStatus === "in_office") return;
-  state.turnDismissed = false;
-  try {
-    if ("Notification" in window && Notification.permission === "granted") {
-      new Notification(queue.groupSize > 1 ? "Your group has been called" : "It’s your turn!", {
-        body: queue.groupSize > 1 ? `Come in with your group for ${queue.reasonLabel}.` : `Go to ${queue.officeLocation} now.`,
-        icon: "/icon.svg",
-      });
-    }
-  } catch {}
-  if ("vibrate" in navigator) navigator.vibrate([250, 100, 250]);
-  playAlertTone();
-}
-
-function alertTwoAhead(queue) {
-  if (!queue || queue.entryStatus !== "waiting" || queue.ahead !== 2 || state.alertedTwoAhead) return;
-  state.alertedTwoAhead = true;
-  if ("vibrate" in navigator) navigator.vibrate([150, 75, 150]);
-  playAlertTone();
-  try {
-    if ("Notification" in window && Notification.permission === "granted") {
-      new Notification("Get ready!", { body: `2 students ahead of you. Head to ${queue.officeLocation}.` });
-    }
-  } catch {}
-}
-
 async function poll() {
-  if (!state.user) return;
+  if (!state.user || state.isPolling) return;
+  state.isPolling = true;
   try {
     if (state.user.role === "student") {
-      const [data, instructorsData] = await Promise.all([
+      const [data, instructorsData, notificationStatus] = await Promise.all([
         request("/api/student/state"),
         request("/api/instructors"),
+        request(`/api/notifications/status?afterId=${state.notificationCursor || 0}`),
       ]);
-      const priorQueue = state.queue;
       state.queue = data.queue;
       state.notice = data.notice;
       state.instructors = instructorsData.instructors;
-      if (state.queue) {
-        alertTurn(state.queue);
-        alertTwoAhead(state.queue);
-        if (priorQueue && priorQueue.queueStatus !== state.queue.queueStatus) {
-          showToast(state.queue.queueStatus === "paused" ? "The instructor paused the queue." : "The instructor updated the queue.");
-          if ("vibrate" in navigator) navigator.vibrate(120);
+      if (state.notificationCursor === null) {
+        state.notificationCursor = notificationStatus.latestId;
+      } else {
+        const newlyArrived = notificationStatus.newNotifications.filter(
+          (notification) => notification.id > state.notificationCursor,
+        );
+        if (newlyArrived.length) {
+          state.notificationCursor = Math.max(...newlyArrived.map((notification) => notification.id));
+          showIncomingNotifications(newlyArrived);
+          if (state.screen === "notifications") {
+            const list = await request("/api/notifications");
+            state.notifications = list.notifications;
+            notificationStatus.unreadCount = 0;
+            state.notificationCursor = Math.max(
+              state.notificationCursor,
+              ...list.notifications.map((notification) => notification.id),
+            );
+          }
         }
-      } else if (priorQueue && data.notice) {
-        showToast(data.notice.text, true);
-        state.alertedTwoAhead = false;
       }
-      state.previousEntryStatus = state.queue?.entryStatus || null;
-      state.previousQueueStatus = state.queue?.queueStatus || null;
-      if (state.screen === "queue" || state.screen === "instructors") renderCurrentScreen();
+      state.unreadCount = notificationStatus.unreadCount;
+      updateNotificationBadge();
+      if (["queue", "instructors", "notifications"].includes(state.screen)) renderCurrentScreen();
     } else {
       const data = await request("/api/instructor/queue");
       const changed = state.queueStatus && state.queueStatus !== data.queueStatus;
@@ -326,6 +423,8 @@ async function poll() {
       state.user = null;
       renderWelcome();
     }
+  } finally {
+    state.isPolling = false;
   }
 }
 
@@ -345,16 +444,17 @@ async function enterApp(user) {
   state.notice = null;
   state.selectedReason = "";
   if (user.role === "student") {
-    const [queueData, instructorsData] = await Promise.all([
+    const [queueData, instructorsData, notificationStatus] = await Promise.all([
       request("/api/student/state"),
       request("/api/instructors"),
+      request("/api/notifications/status?afterId=0"),
     ]);
     state.queue = queueData.queue;
     state.notice = queueData.notice;
     state.instructors = instructorsData.instructors;
+    state.unreadCount = notificationStatus.unreadCount;
+    state.notificationCursor = notificationStatus.latestId;
     state.screen = state.queue ? "queue" : "instructors";
-    if (state.queue) alertTurn(state.queue);
-    state.previousEntryStatus = state.queue?.entryStatus || null;
   } else {
     const data = await request("/api/instructor/queue");
     state.queueStatus = data.queueStatus;
@@ -363,6 +463,37 @@ async function enterApp(user) {
   }
   renderCurrentScreen();
   startPolling();
+}
+
+function updateNotificationBadge() {
+  const bell = document.querySelector('[data-action="open-notifications"]');
+  if (!bell) return;
+  const count = state.unreadCount;
+  bell.setAttribute("aria-label", `Notifications${count ? `, ${count} unread` : ""}`);
+  let badge = bell.querySelector(".notification-badge");
+  if (count && !badge) {
+    badge = document.createElement("span");
+    badge.className = "notification-badge";
+    bell.append(badge);
+  }
+  if (badge) {
+    badge.textContent = count > 99 ? "99+" : String(count);
+    badge.hidden = !count;
+  }
+}
+
+async function openNotifications() {
+  if (state.screen !== "notifications") state.notificationReturnScreen = state.screen;
+  const data = await request("/api/notifications");
+  state.notifications = data.notifications;
+  state.unreadCount = 0;
+  if (data.notifications.length) {
+    state.notificationCursor = Math.max(
+      state.notificationCursor || 0,
+      ...data.notifications.map((notification) => notification.id),
+    );
+  }
+  renderNotifications();
 }
 
 root.addEventListener("click", async (event) => {
@@ -378,7 +509,10 @@ root.addEventListener("click", async (event) => {
       state.authMode = state.authMode === "login" ? "signup" : "login";
       renderAuth();
     } else if (action === "back") {
-      if (button.dataset.destination === "instructors") {
+      if (state.screen === "notifications") {
+        state.screen = button.dataset.destination || state.notificationReturnScreen;
+        renderCurrentScreen();
+      } else if (button.dataset.destination === "instructors") {
         state.queue = null;
         state.screen = "instructors";
         renderInstructors();
@@ -387,6 +521,27 @@ root.addEventListener("click", async (event) => {
       else if (state.user?.role === "student") {
         state.screen = state.queue ? "queue" : "instructors";
         renderCurrentScreen();
+      }
+    } else if (action === "open-notifications") {
+      if (state.screen === "notifications") {
+        state.screen = state.notificationReturnScreen;
+        renderCurrentScreen();
+      } else {
+        await openNotifications();
+      }
+    } else if (action === "clear-notifications") {
+      await request("/api/notifications", { method: "DELETE" });
+      state.notifications = [];
+      state.unreadCount = 0;
+      renderNotifications();
+    } else if (action === "enable-browser-notifications") {
+      if (!("Notification" in window)) {
+        showToast("Browser notifications are not supported here.");
+      } else {
+        await Notification.requestPermission();
+        renderNotifications();
+        if (Notification.permission === "granted") showToast("Browser notifications enabled.");
+        else showToast("In-app notifications will continue to work.");
       }
     } else if (action === "select-instructor") {
       state.selectedInstructor = state.instructors.find((item) => item.id === Number(button.dataset.id));
@@ -401,9 +556,6 @@ root.addEventListener("click", async (event) => {
       renderReason();
       if (state.selectedReason === "other") document.querySelector("#otherReason")?.focus();
     } else if (action === "join-queue") {
-      if ("Notification" in window && Notification.permission === "default") {
-        Notification.requestPermission().catch(() => {});
-      }
       const otherReason = document.querySelector("#otherReason")?.value.trim() || "";
       try {
         await request("/api/queue/join", {
@@ -415,7 +567,6 @@ root.addEventListener("click", async (event) => {
           }),
         });
         state.turnDismissed = false;
-        state.alertedTwoAhead = false;
         await poll();
         state.screen = "queue";
         renderStudentQueue();
@@ -427,7 +578,6 @@ root.addEventListener("click", async (event) => {
       if (!confirm("Leave this queue?")) return;
       await request("/api/queue/leave", { method: "POST", body: JSON.stringify({ entryId: state.queue.entryId }) });
       state.queue = null;
-      state.alertedTwoAhead = false;
       state.screen = "instructors";
       await poll();
       renderInstructors();
@@ -440,7 +590,8 @@ root.addEventListener("click", async (event) => {
       state.user = null;
       state.queue = null;
       state.instructors = [];
-      state.previousEntryStatus = null;
+      state.notificationCursor = null;
+      state.unreadCount = 0;
       renderWelcome();
     } else if (action === "set-status") {
       if (button.dataset.status === "closed" && !confirm("Close office hours and remove all waiting students?")) return;

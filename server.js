@@ -46,10 +46,37 @@ db.exec(`
     entry_id INTEGER NOT NULL REFERENCES queue_entries(id) ON DELETE CASCADE,
     student_id INTEGER NOT NULL REFERENCES users(id),
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    ready_notified INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY(entry_id, student_id)
   );
   CREATE INDEX IF NOT EXISTS queue_members_student ON queue_members(student_id);
+  CREATE TABLE IF NOT EXISTS notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    student_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    queue_entry_id INTEGER REFERENCES queue_entries(id) ON DELETE SET NULL,
+    message TEXT NOT NULL,
+    type TEXT NOT NULL,
+    read_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE INDEX IF NOT EXISTS notifications_student_created
+    ON notifications(student_id, id DESC);
+  CREATE UNIQUE INDEX IF NOT EXISTS notifications_ready_once
+    ON notifications(student_id, queue_entry_id)
+    WHERE type = 'ready' AND queue_entry_id IS NOT NULL;
+  CREATE TABLE IF NOT EXISTS queue_ready_markers (
+    student_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    queue_entry_id INTEGER NOT NULL REFERENCES queue_entries(id) ON DELETE CASCADE,
+    PRIMARY KEY(student_id, queue_entry_id)
+  );
+  INSERT OR IGNORE INTO queue_ready_markers (student_id, queue_entry_id)
+    SELECT student_id, queue_entry_id FROM notifications
+    WHERE type = 'ready' AND queue_entry_id IS NOT NULL;
 `);
+const queueMemberColumns = db.pragma("table_info(queue_members)");
+if (!queueMemberColumns.some((column) => column.name === "ready_notified")) {
+  db.exec("ALTER TABLE queue_members ADD COLUMN ready_notified INTEGER NOT NULL DEFAULT 0");
+}
 
 const app = express();
 app.disable("x-powered-by");
@@ -124,6 +151,67 @@ function requireUser(role) {
 
 function getInstructor(id) {
   return db.prepare("SELECT id, full_name, office_location, queue_status FROM users WHERE id = ? AND role = 'instructor'").get(id);
+}
+
+function addNotification(studentId, message, type, queueEntryId = null) {
+  return db.prepare(`
+    INSERT OR IGNORE INTO notifications (student_id, queue_entry_id, message, type)
+    VALUES (?, ?, ?, ?)
+  `).run(studentId, queueEntryId, message, type).changes > 0;
+}
+
+function createReadyNotifications(instructorId) {
+  const entries = db.prepare(`
+    SELECT id FROM queue_entries
+    WHERE instructor_id = ? AND status = 'waiting'
+    ORDER BY id
+  `).all(instructorId);
+  let ahead = 0;
+  for (const entry of entries) {
+    const members = db.prepare(`
+      SELECT m.student_id, m.ready_notified, i.office_location
+      FROM queue_members m
+      JOIN users i ON i.id = ?
+      WHERE m.entry_id = ?
+    `).all(instructorId, entry.id);
+    if (ahead <= 2) {
+      for (const member of members) {
+        if (member.ready_notified) continue;
+        const marker = db.prepare(`
+          INSERT OR IGNORE INTO queue_ready_markers (student_id, queue_entry_id)
+          VALUES (?, ?)
+        `).run(member.student_id, entry.id);
+        if (!marker.changes) {
+          db.prepare(`
+            UPDATE queue_members SET ready_notified = 1
+            WHERE entry_id = ? AND student_id = ?
+          `).run(entry.id, member.student_id);
+          continue;
+        }
+        addNotification(
+          member.student_id,
+          `Get ready! Only 2 or fewer students ahead of you. Head to ${member.office_location}.`,
+          "ready",
+          entry.id,
+        );
+        db.prepare(`
+          UPDATE queue_members SET ready_notified = 1
+          WHERE entry_id = ? AND student_id = ?
+        `).run(entry.id, member.student_id);
+      }
+    }
+    ahead += members.length;
+  }
+}
+
+function notifyQueueMembers(instructorId, type, message) {
+  const members = db.prepare(`
+    SELECT DISTINCT m.student_id, e.id AS entry_id
+    FROM queue_members m
+    JOIN queue_entries e ON e.id = m.entry_id
+    WHERE e.instructor_id = ? AND e.status IN ('waiting', 'in_office')
+  `).all(instructorId);
+  for (const member of members) addNotification(member.student_id, message, type, member.entry_id);
 }
 
 function getQueueEntries(instructorId) {
@@ -241,6 +329,19 @@ const joinQueue = db.transaction((studentId, instructorId, reason, otherReason) 
     entry = { id: Number(inserted.lastInsertRowid) };
   }
   db.prepare("INSERT INTO queue_members(entry_id, student_id) VALUES (?, ?)").run(entry.id, studentId);
+  const ahead = db.prepare(`
+    SELECT COUNT(m.student_id) AS count
+    FROM queue_entries e
+    LEFT JOIN queue_members m ON m.entry_id = e.id
+    WHERE e.instructor_id = ? AND e.status = 'waiting' AND e.id < ?
+  `).get(instructorId, entry.id).count;
+  addNotification(
+    studentId,
+    `You joined ${instructor.full_name}'s queue. ${ahead} ${ahead === 1 ? "student" : "students"} ahead of you.`,
+    "joined",
+    entry.id,
+  );
+  createReadyNotifications(instructorId);
   return entry.id;
 });
 
@@ -258,6 +359,8 @@ const leaveQueue = db.transaction((studentId, entryId) => {
   if (!remaining) {
     db.prepare("UPDATE queue_entries SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(entryId);
   }
+  const instructorId = db.prepare("SELECT instructor_id FROM queue_entries WHERE id = ?").get(entryId).instructor_id;
+  createReadyNotifications(instructorId);
 });
 
 const advanceQueue = db.transaction((instructorId) => {
@@ -271,6 +374,17 @@ const advanceQueue = db.transaction((instructorId) => {
   `).get(instructorId);
   if (!next) return null;
   db.prepare("UPDATE queue_entries SET status = 'in_office', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(next.id);
+  const entry = db.prepare(`
+    SELECT e.reason, i.full_name AS instructor_name
+    FROM queue_entries e JOIN users i ON i.id = e.instructor_id
+    WHERE e.id = ?
+  `).get(next.id);
+  const memberIds = db.prepare("SELECT student_id FROM queue_members WHERE entry_id = ?").all(next.id);
+  const turnMessage = memberIds.length > 1
+    ? `You've been called in with your group for ${labelFor[entry.reason]}. Go to ${entry.instructor_name}'s office now.`
+    : `It's your turn! Go to ${entry.instructor_name}'s office now.`;
+  for (const member of memberIds) addNotification(member.student_id, turnMessage, "turn", next.id);
+  createReadyNotifications(instructorId);
   return next.id;
 });
 
@@ -367,6 +481,60 @@ app.get("/api/student/state", requireUser("student"), (req, res) => {
   res.json(state);
 });
 
+app.get("/api/notifications/status", requireUser("student"), (req, res) => {
+  const studentId = req.session.user.id;
+  const parsedAfterId = Number(req.query.afterId);
+  const afterId = Number.isSafeInteger(parsedAfterId) && parsedAfterId > 0 ? parsedAfterId : 0;
+  const unreadCount = db.prepare(`
+    SELECT COUNT(*) AS count FROM notifications
+    WHERE student_id = ? AND read_at IS NULL
+  `).get(studentId).count;
+  const latestId = db.prepare(`
+    SELECT COALESCE(MAX(id), 0) AS id FROM notifications WHERE student_id = ?
+  `).get(studentId).id;
+  const newNotifications = db.prepare(`
+    SELECT id, message, type, read_at, created_at
+    FROM notifications WHERE student_id = ? AND id > ?
+    ORDER BY id ASC LIMIT 100
+  `).all(studentId, afterId).map((notification) => ({
+    id: notification.id,
+    message: notification.message,
+    type: notification.type,
+    read: Boolean(notification.read_at),
+    createdAt: notification.created_at,
+  }));
+  res.json({ unreadCount, latestId, newNotifications });
+});
+
+app.get("/api/notifications", requireUser("student"), (req, res) => {
+  const studentId = req.session.user.id;
+  const markReadAndList = db.transaction(() => {
+    const notifications = db.prepare(`
+      SELECT id, message, type, read_at, created_at
+      FROM notifications WHERE student_id = ?
+      ORDER BY id DESC
+    `).all(studentId);
+    db.prepare(`
+      UPDATE notifications SET read_at = CURRENT_TIMESTAMP
+      WHERE student_id = ? AND read_at IS NULL
+    `).run(studentId);
+    return notifications;
+  });
+  const notifications = markReadAndList().map((notification) => ({
+    id: notification.id,
+    message: notification.message,
+    type: notification.type,
+    wasUnread: !notification.read_at,
+    createdAt: notification.created_at,
+  }));
+  res.json({ notifications, unreadCount: 0 });
+});
+
+app.delete("/api/notifications", requireUser("student"), (req, res) => {
+  db.prepare("DELETE FROM notifications WHERE student_id = ?").run(req.session.user.id);
+  res.json({ ok: true, unreadCount: 0 });
+});
+
 app.post("/api/queue/join", requireUser("student"), (req, res, next) => {
   try {
     const instructorId = Number(req.body?.instructorId);
@@ -411,6 +579,16 @@ app.patch("/api/instructor/queue-status", requireUser("instructor"), (req, res, 
     }
     const instructorId = req.session.user.id;
     const update = db.transaction(() => {
+      const current = getInstructor(instructorId);
+      if (current.queue_status !== status) {
+        if (status === "paused") {
+          notifyQueueMembers(instructorId, "queue_paused", "The instructor paused the queue. You remain in line.");
+        } else if (status === "open" && current.queue_status === "paused") {
+          notifyQueueMembers(instructorId, "queue_resumed", "The instructor resumed the queue.");
+        } else if (status === "closed") {
+          notifyQueueMembers(instructorId, "queue_closed", "The instructor closed the queue. Waiting students have been removed.");
+        }
+      }
       if (status === "closed") {
         db.prepare(`
           UPDATE queue_entries SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP
